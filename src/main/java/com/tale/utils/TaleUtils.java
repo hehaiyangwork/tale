@@ -1,21 +1,24 @@
 package com.tale.utils;
 
-import com.blade.context.WebContextHolder;
 import com.blade.kit.DateKit;
+import com.blade.kit.Hashids;
 import com.blade.kit.StringKit;
-import com.blade.kit.Tools;
 import com.blade.mvc.http.Request;
 import com.blade.mvc.http.Response;
-import com.blade.mvc.http.wrapper.Session;
+import com.blade.mvc.http.Session;
 import com.sun.syndication.feed.rss.Channel;
 import com.sun.syndication.feed.rss.Content;
 import com.sun.syndication.feed.rss.Item;
 import com.sun.syndication.io.FeedException;
 import com.sun.syndication.io.WireFeedOutput;
-import com.tale.ext.Commons;
+import com.tale.controller.admin.AttachController;
+import com.tale.extension.Commons;
+import com.tale.extension.Theme;
 import com.tale.init.TaleConst;
-import com.tale.model.Contents;
-import com.tale.model.Users;
+import com.tale.model.entity.Contents;
+import com.tale.model.entity.Users;
+import org.commonmark.Extension;
+import org.commonmark.ext.gfm.tables.TablesExtension;
 import org.commonmark.node.Node;
 import org.commonmark.parser.Parser;
 import org.commonmark.renderer.html.HtmlRenderer;
@@ -23,11 +26,10 @@ import org.commonmark.renderer.html.HtmlRenderer;
 import javax.imageio.ImageIO;
 import java.awt.*;
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileNotFoundException;
-import java.io.OutputStream;
-import java.text.Normalizer;
-import java.util.ArrayList;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.*;
+import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -41,12 +43,10 @@ public class TaleUtils {
     /**
      * 一个月
      */
-    private static final int one_month = 30 * 24 * 60 * 60;
-
-    /**
-     * markdown解析器
-     */
-    private static Parser parser = Parser.builder().build();
+    private static final int     ONE_MONTH   = 30 * 24 * 60 * 60;
+    private static final Random  R           = new Random();
+    private static final Hashids HASH_IDS    = new Hashids(TaleConst.AES_SALT);
+    private static final long[]  HASH_PREFIX = {-1, 2, 0, 1, 7, 0, 9};
 
     /**
      * 匹配邮箱正则
@@ -64,9 +64,12 @@ public class TaleUtils {
      */
     public static void setCookie(Response response, Integer uid) {
         try {
-            String val = Tools.enAes(uid.toString(), TaleConst.AES_SALT);
+            HASH_PREFIX[0] = uid;
+            String val = HASH_IDS.encode(HASH_PREFIX);
+            HASH_PREFIX[0] = -1;
+//            String  val   = new String(EncrypKit.encryptAES(uid.toString().getBytes(), TaleConst.AES_SALT.getBytes()));
             boolean isSSL = Commons.site_url().startsWith("https");
-            response.cookie("/", TaleConst.USER_IN_COOKIE, val, one_month, isSSL);
+            response.cookie("/", TaleConst.USER_IN_COOKIE, val, ONE_MONTH, isSSL);
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -78,7 +81,7 @@ public class TaleUtils {
      * @return
      */
     public static Users getLoginUser() {
-        Session session = WebContextHolder.session();
+        Session session = com.blade.mvc.WebContext.request().session();
         if (null == session) {
             return null;
         }
@@ -106,11 +109,14 @@ public class TaleUtils {
      */
     public static Integer getCookieUid(Request request) {
         if (null != request) {
-            String value = request.cookie(TaleConst.USER_IN_COOKIE);
-            if (StringKit.isNotBlank(value)) {
+            Optional<String> c = request.cookie(TaleConst.USER_IN_COOKIE);
+            if (c.isPresent()) {
                 try {
-                    String uid = Tools.deAes(value, TaleConst.AES_SALT);
-                    return StringKit.isNotBlank(uid) && StringKit.isNumber(uid) ? Integer.valueOf(uid) : null;
+                    String value = c.get();
+                    long[] ids   = HASH_IDS.decode(value);
+                    if (null != ids && ids.length > 0) {
+                        return Long.valueOf(ids[0]).intValue();
+                    }
                 } catch (Exception e) {
                 }
             }
@@ -131,7 +137,7 @@ public class TaleUtils {
         if (arr.length == 1) {
             return "'" + arr[0] + "'";
         }
-        String a = StringKit.join(arr, "','");
+        String a = String.join("','", arr);
         a = a.substring(2) + "'";
         return a;
     }
@@ -146,9 +152,12 @@ public class TaleUtils {
         if (StringKit.isBlank(markdown)) {
             return "";
         }
-        Node document = parser.parse(markdown);
-        HtmlRenderer renderer = HtmlRenderer.builder().build();
-        String content = renderer.render(document);
+
+        List<Extension> extensions = Arrays.asList(TablesExtension.create());
+        Parser          parser     = Parser.builder().extensions(extensions).build();
+        Node            document   = parser.parse(markdown);
+        HtmlRenderer    renderer   = HtmlRenderer.builder().extensions(extensions).build();
+        String          content    = renderer.render(document);
         content = Commons.emoji(content);
 
         // 支持网易云音乐输出
@@ -159,6 +168,7 @@ public class TaleUtils {
         if (TaleConst.BCONF.getBoolean("app.support_gist", true) && content.contains("https://gist.github.com/")) {
             content = content.replaceAll("&lt;script src=\"https://gist.github.com/(\\w+)/(\\w+)\\.js\">&lt;/script>", "<script src=\"https://gist.github.com/$1/$2\\.js\"></script>");
         }
+
         return content;
     }
 
@@ -233,32 +243,56 @@ public class TaleUtils {
      */
     public static String getRssXml(java.util.List<Contents> articles) throws FeedException {
         Channel channel = new Channel("rss_2.0");
-        channel.setTitle(TaleConst.OPTIONS.get("site_title"));
+        channel.setTitle(TaleConst.OPTIONS.get("site_title", ""));
         channel.setLink(Commons.site_url());
-        channel.setDescription(TaleConst.OPTIONS.get("site_description"));
+        channel.setDescription(TaleConst.OPTIONS.get("site_description", ""));
         channel.setLanguage("zh-CN");
         java.util.List<Item> items = new ArrayList<>();
         articles.forEach(post -> {
             Item item = new Item();
             item.setTitle(post.getTitle());
             Content content = new Content();
-            content.setValue(Commons.article(post.getContent()));
+            String  value   = Theme.article(post.getContent());
+
+            char[] xmlChar = value.toCharArray();
+            for (int i = 0; i < xmlChar.length; ++i) {
+                if (xmlChar[i] > 0xFFFD) {
+                    //直接替换掉0xb
+                    xmlChar[i] = ' ';
+                } else if (xmlChar[i] < 0x20 && xmlChar[i] != 't' & xmlChar[i] != 'n' & xmlChar[i] != 'r') {
+                    //直接替换掉0xb
+                    xmlChar[i] = ' ';
+                }
+            }
+
+            value = new String(xmlChar);
+
+            content.setValue(value);
             item.setContent(content);
-            item.setLink(Commons.permalink(post.getCid(), post.getSlug()));
-            item.setPubDate(DateKit.getDateByUnixTime(post.getCreated()));
+            item.setLink(Theme.permalink(post.getCid(), post.getSlug()));
+            item.setPubDate(DateKit.toDate(post.getCreated()));
             items.add(item);
         });
         channel.setItems(items);
         WireFeedOutput out = new WireFeedOutput();
         return out.outputString(channel);
+//        try {
+//            return out.outputString(channel);
+//        } catch (org.jdom.IllegalDataException e) {
+//            //e.printStackTrace();
+//
+//        } catch (Exception e) {
+//            throw e;
+//        }
     }
 
     /**
      * 替换HTML脚本
+     *
      * @param value
      * @return
      */
-    public static String cleanXSS(String value){
+    public static String cleanXSS(String value) {
         //You'll need to remove the spaces from the html entities below
         value = value.replaceAll("<", "&lt;").replaceAll(">", "&gt;");
         value = value.replaceAll("\\(", "&#40;").replaceAll("\\)", "&#41;");
@@ -270,78 +304,53 @@ public class TaleUtils {
     }
 
     /**
-     * 过滤XSS注入
+     * 获取某个范围内的随机数
      *
-     * @param value
+     * @param max 最大值
+     * @param len 取多少个
      * @return
      */
-    public static String filterXSS(String value) {
-        String cleanValue = null;
-        if (value != null) {
-            cleanValue = Normalizer.normalize(value, Normalizer.Form.NFD);
-            // Avoid null characters
-            cleanValue = cleanValue.replaceAll("\0", "");
-
-            // Avoid anything between script tags
-            Pattern scriptPattern = Pattern.compile("<script>(.*?)</script>", Pattern.CASE_INSENSITIVE);
-            cleanValue = scriptPattern.matcher(cleanValue).replaceAll("");
-
-            // Avoid anything in a src='...' type of expression
-            scriptPattern = Pattern.compile("src[\r\n]*=[\r\n]*\\\'(.*?)\\\'", Pattern.CASE_INSENSITIVE | Pattern.MULTILINE | Pattern.DOTALL);
-            cleanValue = scriptPattern.matcher(cleanValue).replaceAll("");
-
-            scriptPattern = Pattern.compile("src[\r\n]*=[\r\n]*\\\"(.*?)\\\"", Pattern.CASE_INSENSITIVE | Pattern.MULTILINE | Pattern.DOTALL);
-            cleanValue = scriptPattern.matcher(cleanValue).replaceAll("");
-
-            // Remove any lonesome </script> tag
-            scriptPattern = Pattern.compile("</script>", Pattern.CASE_INSENSITIVE);
-            cleanValue = scriptPattern.matcher(cleanValue).replaceAll("");
-
-            // Remove any lonesome <script ...> tag
-            scriptPattern = Pattern.compile("<script(.*?)>", Pattern.CASE_INSENSITIVE | Pattern.MULTILINE | Pattern.DOTALL);
-            cleanValue = scriptPattern.matcher(cleanValue).replaceAll("");
-
-            // Avoid eval(...) expressions
-            scriptPattern = Pattern.compile("eval\\((.*?)\\)", Pattern.CASE_INSENSITIVE | Pattern.MULTILINE | Pattern.DOTALL);
-            cleanValue = scriptPattern.matcher(cleanValue).replaceAll("");
-
-            // Avoid expression(...) expressions
-            scriptPattern = Pattern.compile("expression\\((.*?)\\)", Pattern.CASE_INSENSITIVE | Pattern.MULTILINE | Pattern.DOTALL);
-            cleanValue = scriptPattern.matcher(cleanValue).replaceAll("");
-
-            // Avoid javascript:... expressions
-            scriptPattern = Pattern.compile("javascript:", Pattern.CASE_INSENSITIVE);
-            cleanValue = scriptPattern.matcher(cleanValue).replaceAll("");
-
-            // Avoid vbscript:... expressions
-            scriptPattern = Pattern.compile("vbscript:", Pattern.CASE_INSENSITIVE);
-            cleanValue = scriptPattern.matcher(cleanValue).replaceAll("");
-
-            // Avoid onload= expressions
-            scriptPattern = Pattern.compile("onload(.*?)=", Pattern.CASE_INSENSITIVE | Pattern.MULTILINE | Pattern.DOTALL);
-            cleanValue = scriptPattern.matcher(cleanValue).replaceAll("");
+    public static int[] random(int max, int len) {
+        int values[] = new int[max];
+        int temp1, temp2, temp3;
+        for (int i = 0; i < values.length; i++) {
+            values[i] = i + 1;
         }
-        return cleanValue;
+        //随机交换values.length次
+        for (int i = 0; i < values.length; i++) {
+            temp1 = Math.abs(R.nextInt()) % (values.length - 1); //随机产生一个位置
+            temp2 = Math.abs(R.nextInt()) % (values.length - 1); //随机产生另一个位置
+            if (temp1 != temp2) {
+                temp3 = values[temp1];
+                values[temp1] = values[temp2];
+                values[temp2] = temp3;
+            }
+        }
+        return Arrays.copyOf(values, len);
     }
 
-    public static void download(Response response, String filePath) throws Exception {
-
-        response.contentType("application/octet-stream");
-        response.header("Content-Transfer-Encoding", "binary");
-
-        File file = new File(filePath);
-        String fname = file.getName();
-        response.header("Content-Disposition", "attachment; filename=" + fname);
-        OutputStream out = response.outputStream();
-        FileInputStream in = new FileInputStream(file);
-        byte[] buffer = new byte[1024];
-        int length;
-        while ((length = in.read(buffer)) > 0){
-            out.write(buffer, 0, length);
-        }
-        in.close();
-        out.flush();
-        out.close();
+    /**
+     * 将list转为 (1, 2, 4) 这样的sql输出
+     *
+     * @param list
+     * @param <T>
+     * @return
+     */
+    public static <T> String listToInSql(java.util.List<T> list) {
+        StringBuffer sbuf = new StringBuffer();
+        list.forEach(item -> sbuf.append(',').append(item.toString()));
+        sbuf.append(')');
+        return '(' + sbuf.substring(1);
     }
 
+    public static final String UP_DIR = AttachController.CLASSPATH.substring(0, AttachController.CLASSPATH.length() - 1);
+
+    public static String getFileKey(String name) {
+        String prefix = "/upload/" + DateKit.toString(new Date(), "yyyy/MM");
+        String dir    = UP_DIR + prefix;
+        if (!Files.exists(Paths.get(dir))) {
+            new File(dir).mkdirs();
+        }
+        return prefix + "/" + com.blade.kit.UUID.UU32() + "." + StringKit.fileExt(name);
+    }
 }
